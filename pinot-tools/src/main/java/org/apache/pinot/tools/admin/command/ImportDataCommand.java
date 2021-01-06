@@ -19,7 +19,6 @@
 package org.apache.pinot.tools.admin.command;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableMap;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
@@ -33,6 +32,7 @@ import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.controller.helix.ControllerRequestURLBuilder;
 import org.apache.pinot.spi.data.readers.FileFormat;
+import org.apache.pinot.spi.filesystem.PinotFSFactory;
 import org.apache.pinot.spi.ingestion.batch.BatchConfigProperties;
 import org.apache.pinot.spi.ingestion.batch.IngestionJobLauncher;
 import org.apache.pinot.spi.ingestion.batch.spec.ExecutionFrameworkSpec;
@@ -64,6 +64,9 @@ public class ImportDataCommand extends AbstractBaseAdminCommand implements Comma
 
   @Option(name = "-format", required = true, metaVar = "<AVRO/CSV/JSON/THRIFT/PARQUET/ORC>", usage = "Input data format.")
   private FileFormat _format;
+
+  @Option(name = "-segmentNameGeneratorType", metaVar = "<AVRO/CSV/JSON/THRIFT/PARQUET/ORC>", usage = "Segment name generator type, default to FIXED type.")
+  private String _segmentNameGeneratorType = BatchConfigProperties.SegmentNameGeneratorType.FIXED;
 
   @Option(name = "-table", required = true, metaVar = "<string>", usage = "Table name.")
   private String _table;
@@ -224,8 +227,12 @@ public class ImportDataCommand extends AbstractBaseAdminCommand implements Comma
     // set PinotFSSpecs
     List<PinotFSSpec> pinotFSSpecs = new ArrayList<>();
     pinotFSSpecs.add(getPinotFSSpec("file", "org.apache.pinot.spi.filesystem.LocalPinotFS", Collections.emptyMap()));
-    pinotFSSpecs
-        .add(getPinotFSSpec("s3", "org.apache.pinot.plugin.filesystem.S3PinotFS", getS3PinotFSConfigs(extraConfigs)));
+    final String inputFileScheme = dataFileURI.getScheme();
+    if ((inputFileScheme != null) && (!PinotFSFactory.isSchemeSupported(inputFileScheme))) {
+      String pinotFSClassName = getPinotFSClassName(inputFileScheme);
+      Map<String, String> pinotFSConfigs = getPinotFSConfigs(inputFileScheme, extraConfigs);
+      pinotFSSpecs.add(getPinotFSSpec(inputFileScheme, pinotFSClassName, getS3PinotFSConfigs(extraConfigs)));
+    }
     spec.setPinotFSSpecs(pinotFSSpecs);
 
     // set RecordReaderSpec
@@ -245,11 +252,9 @@ public class ImportDataCommand extends AbstractBaseAdminCommand implements Comma
 
     // set SegmentNameGeneratorSpec
     SegmentNameGeneratorSpec segmentNameGeneratorSpec = new SegmentNameGeneratorSpec();
-    segmentNameGeneratorSpec
-        .setType(org.apache.pinot.spi.ingestion.batch.BatchConfigProperties.SegmentNameGeneratorType.FIXED);
-    String segmentName = (extraConfigs.containsKey(SEGMENT_NAME)) ? extraConfigs.get(SEGMENT_NAME)
-        : String.format("%s_%s", _table, DigestUtils.sha256Hex(_dataFilePath));
-    segmentNameGeneratorSpec.setConfigs(ImmutableMap.of(SEGMENT_NAME, segmentName));
+    String segmentNameGeneratorType = getSegmentNameGeneratorType(extraConfigs);
+    segmentNameGeneratorSpec.setType(segmentNameGeneratorType);
+    segmentNameGeneratorSpec.setConfigs(getSegmentNameGeneratorConfig(segmentNameGeneratorType, extraConfigs));
     spec.setSegmentNameGeneratorSpec(segmentNameGeneratorSpec);
 
     // set PinotClusterSpecs
@@ -265,6 +270,41 @@ public class ImportDataCommand extends AbstractBaseAdminCommand implements Comma
     spec.setPushJobSpec(pushJobSpec);
 
     return spec;
+  }
+
+  private Map<String, String> getSegmentNameGeneratorConfig(String type, Map<String, String> extraConfigs) {
+    Map<String, String> segmentNameGeneratorConfig = new HashMap<>(extraConfigs);
+    if ((BatchConfigProperties.SegmentNameGeneratorType.FIXED.equalsIgnoreCase(type)) && (!segmentNameGeneratorConfig
+        .containsKey(SEGMENT_NAME))) {
+      segmentNameGeneratorConfig
+          .put(SEGMENT_NAME, String.format("%s_%s", _table, DigestUtils.sha256Hex(_dataFilePath)));
+    }
+    return segmentNameGeneratorConfig;
+  }
+
+  private String getSegmentNameGeneratorType(Map<String, String> extraConfigs) {
+    if (_segmentNameGeneratorType == null) {
+      return extraConfigs.getOrDefault(BatchConfigProperties.SEGMENT_NAME_GENERATOR_TYPE, BatchConfigProperties.SegmentNameGeneratorType.FIXED);
+    }
+    return _segmentNameGeneratorType;
+  }
+
+  private Map<String, String> getPinotFSConfigs(String scheme, Map<String, String> extraConfigs) {
+    switch (scheme) {
+      case "s3":
+        return getS3PinotFSConfigs(extraConfigs);
+      default:
+        throw new IllegalArgumentException("Unknown input file scheme - " + scheme);
+    }
+  }
+
+  private String getPinotFSClassName(String scheme) {
+    switch (scheme) {
+      case "s3":
+        return "org.apache.pinot.plugin.filesystem.S3PinotFS";
+      default:
+        throw new IllegalArgumentException("Unknown input file scheme - " + scheme);
+    }
   }
 
   private Map<String, String> getS3PinotFSConfigs(Map<String, String> extraConfigs) {
